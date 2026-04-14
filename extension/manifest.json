@@ -26,7 +26,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["utils/*.js"],
+      "resources": ["utils/*.js", "inpage-interceptor.js"],
       "matches": ["<all_urls>"]
     }
   ],
