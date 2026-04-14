@@ -824,18 +824,17 @@ function notifyDevTools(message) {
  * Download file to user's computer
  */
 async function downloadFile(content, fileName) {
-  const blob = new Blob([content], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
+  // Convert to data URL (service workers don't have URL.createObjectURL)
+  const mimeType = fileName.endsWith('.json') ? 'application/json' : 'text/plain';
+  const encoded = encodeURIComponent(content);
+  const dataUrl = `data:${mimeType};charset=utf-8,${encoded}`;
 
   // Create download
   await chrome.downloads.download({
-    url: url,
+    url: dataUrl,
     filename: fileName,
     saveAs: true
   });
-
-  // Cleanup
-  URL.revokeObjectURL(url);
 }
 
 /**

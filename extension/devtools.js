@@ -15,12 +15,17 @@ chrome.devtools.panels.create(
 if (chrome && chrome.devtools && chrome.devtools.network && chrome.runtime) {
   chrome.devtools.network.onRequestFinished.addListener((request) => {
     try {
+      // Normalize status code (304 = cached 200, treat as 200 for QA)
+      const rawStatus = request.response ? request.response.status : null;
+      const normalizedStatus = rawStatus === 304 ? 200 : rawStatus;
+
       // Build basic apiCall object
       const apiCall = {
         tabId: chrome.devtools.inspectedWindow.tabId,
         method: request.request.method,
         url: request.request.url,
-        status: request.response ? request.response.status : null,
+        status: normalizedStatus,
+        rawStatus: rawStatus,
         requestHeaders: request.request.headers || [],
         responseHeaders: request.response ? (request.response.headers || []) : [],
         requestBody: request.request.postData ? request.request.postData.text : null,
