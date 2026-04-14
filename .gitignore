@@ -1,0 +1,9 @@
+.devloop/
+# OS files
+.DS_Store
+# Node
+node_modules/
+# Editor
+.vscode/
+# Logs
+*.log
