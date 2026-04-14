@@ -310,6 +310,7 @@ function handleUIAction(message, sender) {
   // Add to correlation engine
   if (correlationEngine) {
     correlationEngine.addUIAction(action);
+    syncFlowDataFromEngine();
   }
 
   persistSession().catch(error => {
@@ -341,6 +342,9 @@ function handleAPICall(message, sender) {
 
   if (captureResult.shouldAddToCorrelation && correlationEngine) {
     correlationEngine.addAPICall(captureResult.apiCall);
+    syncFlowDataFromEngine();
+  } else if (captureResult.deduped) {
+    syncFlowDataFromEngine();
   }
 
   persistSession().catch(error => {
@@ -627,6 +631,7 @@ async function handleGetRecordingState(sendResponse) {
  * Get current flow data
  */
 function getFlowData() {
+  syncFlowDataFromEngine();
   return {
     uiActions: flowData.uiActions,
     apiCalls: flowData.apiCalls,
@@ -652,6 +657,7 @@ function clearFlowData() {
 
   if (correlationEngine) {
     correlationEngine.clear();
+    syncFlowDataFromEngine();
   }
 
   resetAPICaptureState();
@@ -700,15 +706,23 @@ async function restorePersistedSession() {
     apiCaptureState = session.apiCaptureState || apiCaptureState;
 
     initCorrelationEngine();
-    correlationEngine.uiActions = structuredClone(flowData.uiActions);
-    correlationEngine.apiCalls = structuredClone(flowData.apiCalls);
-    correlationEngine.correlations = structuredClone(flowData.correlations);
+    correlationEngine.uiActions = enrichStoredUIActions(
+      structuredClone(session.flowData?.uiActions || []),
+      structuredClone(session.flowData?.correlations || [])
+    );
+    correlationEngine.apiCalls = enrichStoredAPICalls(
+      structuredClone(session.flowData?.apiCalls || []),
+      structuredClone(session.flowData?.correlations || [])
+    );
+    correlationEngine.correlations = structuredClone(session.flowData?.correlations || []);
+    syncFlowDataFromEngine();
   } catch (error) {
     console.debug('Failed to restore persisted session:', error.message || error);
   }
 }
 
 async function persistSession() {
+  syncFlowDataFromEngine();
   const session = {
     isRecording,
     recordingStartTime,
@@ -722,6 +736,51 @@ async function persistSession() {
 
   await chrome.storage.local.set({
     [SESSION_STORAGE_KEY]: session
+  });
+}
+
+function syncFlowDataFromEngine() {
+  if (!correlationEngine) {
+    return;
+  }
+
+  flowData.uiActions = structuredClone(correlationEngine.uiActions || []);
+  flowData.apiCalls = structuredClone(correlationEngine.apiCalls || []);
+  flowData.correlations = structuredClone(correlationEngine.getCorrelations() || []);
+}
+
+function enrichStoredUIActions(uiActions, correlations) {
+  const correlatedIds = new Set(
+    correlations
+      .map(corr => corr.uiAction?.id)
+      .filter(Boolean)
+  );
+
+  return uiActions.map(action => ({
+    ...action,
+    correlated: correlatedIds.has(action.id)
+  }));
+}
+
+function enrichStoredAPICalls(apiCalls, correlations) {
+  const apiById = new Map();
+  correlations.forEach(corr => {
+    (corr.apiCalls || []).forEach(api => {
+      if (api.id) {
+        apiById.set(api.id, api);
+      }
+    });
+  });
+
+  return apiCalls.map(api => {
+    const correlatedApi = apiById.get(api.id);
+    return {
+      ...api,
+      correlated: Boolean(correlatedApi),
+      classification: api.classification || correlatedApi?.classification || 'unknown',
+      classificationReasons: api.classificationReasons || correlatedApi?.classificationReasons || [],
+      classificationScore: api.classificationScore ?? correlatedApi?.classificationScore ?? 0
+    };
   });
 }
 
