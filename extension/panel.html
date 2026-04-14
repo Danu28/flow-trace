@@ -47,27 +47,119 @@
       border: 1px solid #e0e0e0;
       border-radius: 4px;
       padding: 12px;
-      max-height: 400px;
+      max-height: 560px;
       overflow-y: auto;
       background: #fafafa;
     }
-    .flow-step {
+    .flow-card {
       background: white;
-      border: 1px solid #e0e0e0;
-      border-radius: 4px;
-      padding: 10px;
-      margin-bottom: 8px;
-      font-size: 12px;
+      border: 1px solid #dfe4ea;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
     }
-    .flow-step.ui-action { border-left: 3px solid #1a73e8; }
-    .flow-step.api-call { border-left: 3px solid #4caf50; }
-    .flow-step.response { border-left: 3px solid #ff9800; }
-    .flow-step .step-type { font-weight: 600; margin-bottom: 4px; }
-    .flow-step .step-details { color: #666; font-size: 11px; }
-    .flow-step .step-time { color: #999; font-size: 10px; margin-top: 4px; }
-    .empty-state { text-align: center; color: #999; padding: 40px; }
-    .export-options { display: flex; gap: 8px; flex-wrap: wrap; }
-    .stats { display: flex; gap: 16px; font-size: 12px; color: #666; margin-bottom: 12px; }
+    .flow-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      gap: 12px;
+    }
+    .flow-card-title { font-weight: 600; color: #1f2937; }
+    .badge-row { display: flex; gap: 6px; flex-wrap: wrap; }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge.high { background: #e8f5e9; color: #256029; }
+    .badge.medium { background: #fff8e1; color: #8d6e00; }
+    .badge.low { background: #ffebee; color: #b71c1c; }
+    .badge.pending { background: #eceff1; color: #455a64; }
+    .badge.reviewed { background: #e3f2fd; color: #0d47a1; }
+    .flow-meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+      font-size: 12px;
+      color: #5f6368;
+      margin-bottom: 10px;
+    }
+    .flow-block {
+      border-top: 1px solid #eef2f7;
+      padding-top: 10px;
+      margin-top: 10px;
+    }
+    .flow-block h3 {
+      font-size: 12px;
+      color: #4b5563;
+      margin-bottom: 6px;
+    }
+    .api-item {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      padding: 8px;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      margin-bottom: 6px;
+      background: #fbfdff;
+    }
+    .api-item.ignored {
+      opacity: 0.65;
+      background: #fafafa;
+    }
+    .api-body {
+      flex: 1;
+      font-size: 12px;
+      color: #4b5563;
+      line-height: 1.5;
+    }
+    .api-url {
+      font-family: Consolas, Monaco, monospace;
+      font-size: 11px;
+      word-break: break-all;
+    }
+    .reason-list, .variable-list {
+      font-size: 11px;
+      color: #5f6368;
+      line-height: 1.5;
+      margin-top: 4px;
+    }
+    .assertion-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    textarea, select {
+      width: 100%;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 12px;
+      font-family: inherit;
+      background: white;
+    }
+    textarea {
+      min-height: 66px;
+      resize: vertical;
+    }
+    .actions-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .small-note {
+      font-size: 11px;
+      color: #6b7280;
+    }
+    .stats { display: flex; gap: 16px; font-size: 12px; color: #666; margin-bottom: 12px; flex-wrap: wrap; }
     .stat { background: #f0f0f0; padding: 4px 8px; border-radius: 4px; }
     pre {
       background: #263238;
@@ -92,24 +184,27 @@
     .tab.active { background: #1a73e8; color: white; }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
+    .empty-state { text-align: center; color: #999; padding: 40px; }
+    .export-options { display: flex; gap: 8px; flex-wrap: wrap; }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1>🔍 FlowTrace QA</h1>
+    <h1>FlowTrace QA</h1>
     <span class="status idle" id="statusIndicator">Idle</span>
   </div>
 
   <div class="controls">
-    <button class="primary" id="btnStart">▶ Start Recording</button>
-    <button class="danger" id="btnStop" disabled>⏹ Stop Recording</button>
-    <button class="secondary" id="btnClear">🗑 Clear</button>
+    <button class="primary" id="btnStart">Start Recording</button>
+    <button class="danger" id="btnStop" disabled>Stop Recording</button>
+    <button class="secondary" id="btnClear">Clear</button>
   </div>
 
   <div class="stats" id="stats">
     <span class="stat">UI Actions: <strong id="statActions">0</strong></span>
     <span class="stat">API Calls: <strong id="statApis">0</strong></span>
     <span class="stat">Correlations: <strong id="statCorrelations">0</strong></span>
+    <span class="stat">Deduped APIs: <strong id="statDeduped">0</strong></span>
   </div>
 
   <div class="tabs">
@@ -120,7 +215,7 @@
 
   <div class="tab-content active" id="tab-flow">
     <div class="section">
-      <h2>Recorded Flow</h2>
+      <h2>Recorded Flow Review</h2>
       <div class="flow-container" id="flowContainer">
         <div class="empty-state">
           <p>No flow recorded yet</p>

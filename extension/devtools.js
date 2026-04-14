@@ -17,6 +17,7 @@ if (chrome && chrome.devtools && chrome.devtools.network && chrome.runtime) {
     try {
       // Build basic apiCall object
       const apiCall = {
+        tabId: chrome.devtools.inspectedWindow.tabId,
         method: request.request.method,
         url: request.request.url,
         status: request.response ? request.response.status : null,
@@ -24,7 +25,11 @@ if (chrome && chrome.devtools && chrome.devtools.network && chrome.runtime) {
         responseHeaders: request.response ? (request.response.headers || []) : [],
         requestBody: request.request.postData ? request.request.postData.text : null,
         responseBody: null,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        capture: {
+          source: 'devtools',
+          mode: 'devtools-primary'
+        }
       };
 
       // Try to get response body (may be large or unavailable)

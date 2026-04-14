@@ -11,7 +11,7 @@
   let isRecording = false;
   let actionBuffer = [];
   let domMutationBuffer = [];
-  const CORRELATION_WINDOW = 1500; // ms
+  let networkCaptureMode = 'devtools-primary';
 
   // Inject in-page network interception script so fetch/XHR running in page context are captured.
   (function injectInPageInterceptor() {
@@ -85,49 +85,41 @@
     // Listen for messages from in-page script and forward to background
     window.addEventListener('message', (event) => {
       if (!event.data || event.data.source !== 'flowtrace-inpage') return;
+      if (!isRecording || networkCaptureMode !== 'content-fallback') return;
       try {
-        chrome.runtime.sendMessage({ type: 'API_CALL', apiCall: event.data.apiCall }, () => {});
+        chrome.runtime.sendMessage({
+          type: 'API_CALL',
+          apiCall: {
+            ...event.data.apiCall,
+            capture: {
+              source: 'content',
+              mode: networkCaptureMode
+            }
+          }
+        }, () => {});
       } catch (e) {}
     });
   })();
 
-  // Selector utility (inline for content script)
-  const SelectorUtils = {
+  const SelectorUtils = window.SelectorUtils || {
     getStableSelector(element) {
-      if (!element) return { selector: null, type: null, xpath: null };
-
-      if (element.id && element.id.trim() !== '') {
-        return { selector: `#${element.id}`, type: 'id', xpath: this.getXPath(element) };
-      }
-
-      const dataAttr = this.getDataAttribute(element);
-      if (dataAttr) {
-        return { selector: `[${dataAttr.name}="${dataAttr.value}"]`, type: 'data-attribute', xpath: this.getXPath(element) };
-      }
-
-      if (element.name && element.name.trim() !== '') {
-        return { selector: `[name="${element.name}"]`, type: 'name', xpath: this.getXPath(element) };
-      }
-
-      if (element.className && typeof element.className === 'string' && element.className.trim() !== '') {
-        const classes = element.className.trim().split(/\s+/).slice(0, 2);
-        return { selector: `${element.tagName.toLowerCase()}.${classes.join('.')}`, type: 'class', xpath: this.getXPath(element) };
-      }
-
+      if (!element) return { selector: null, type: null, xpath: null, candidates: [], primary: null, meta: null };
       const xpath = this.getXPath(element);
-      return { selector: xpath, type: 'xpath', xpath: xpath };
-    },
-
-    getDataAttribute(element) {
-      if (!element.attributes) return null;
-      for (let attr of element.attributes) {
-        if (attr.name.startsWith('data-') && attr.value && attr.value.trim() !== '') {
-          return { name: attr.name, value: attr.value };
+      const selector = element.id ? `#${element.id}` : xpath;
+      return {
+        selector,
+        type: element.id ? 'id' : 'xpath',
+        xpath,
+        candidates: selector ? [{ type: element.id ? 'id' : 'xpath', value: selector, score: element.id ? 100 : 30 }] : [],
+        primary: selector ? { type: element.id ? 'id' : 'xpath', value: selector, score: element.id ? 100 : 30 } : null,
+        meta: {
+          tagName: element.tagName ? element.tagName.toLowerCase() : 'unknown',
+          role: element.getAttribute ? element.getAttribute('role') || null : null,
+          name: element.name || null,
+          text: (element.innerText || element.textContent || '').trim().substring(0, 60)
         }
-      }
-      return null;
+      };
     },
-
     getXPath(element) {
       if (!element) return null;
       const parts = [];
@@ -226,7 +218,10 @@
       selector: selector.selector,
       selectorType: selector.type,
       xpath: selector.xpath,
+      selectorCandidates: selector.candidates || [],
+      selectorProfile: selector,
       elementTag: target.tagName ? target.tagName.toLowerCase() : 'unknown',
+      elementRole: target.getAttribute ? target.getAttribute('role') || null : null,
       elementText: target.textContent ? target.textContent.trim().substring(0, 50) : '',
       coordinates: { x: event.clientX, y: event.clientY }
     });
@@ -250,9 +245,12 @@
       selector: selector.selector,
       selectorType: selector.type,
       xpath: selector.xpath,
+      selectorCandidates: selector.candidates || [],
+      selectorProfile: selector,
       elementTag: tagName,
       elementType: target.type || null,
       elementName: target.name || null,
+      elementRole: target.getAttribute ? target.getAttribute('role') || null : null,
       inputValue: target.value ? target.value.substring(0, 200) : '',
       placeholder: target.placeholder || null
     });
@@ -274,7 +272,10 @@
         selector: selector.selector,
         selectorType: selector.type,
         xpath: selector.xpath,
+        selectorCandidates: selector.candidates || [],
+        selectorProfile: selector,
         elementTag: tagName,
+        elementName: target.name || null,
         elementType: target.type || null
       });
     }
@@ -403,12 +404,14 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case 'START_RECORDING':
+        networkCaptureMode = message.networkCaptureMode || 'devtools-primary';
         startRecording();
         sendResponse({ success: true, status: 'recording' });
         break;
       
       case 'STOP_RECORDING':
         stopRecording();
+        networkCaptureMode = 'devtools-primary';
         sendResponse({ success: true, status: 'stopped', data: getRecordedData() });
         break;
       
@@ -418,6 +421,7 @@
       
       case 'CLEAR_DATA':
         clearData();
+        networkCaptureMode = 'devtools-primary';
         sendResponse({ success: true });
         break;
       

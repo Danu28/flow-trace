@@ -1,8 +1,6 @@
 /**
  * Code Exporter
- * Generates test automation code from recorded flows
- * - Selenium Java + TestNG with WebDriverWait
- * - Rest Assured with given/when/then
+ * Generates QA-oriented automation code from reviewed FlowTrace sessions.
  */
 
 class CodeExporter {
@@ -11,18 +9,12 @@ class CodeExporter {
     this.newLine = '\n';
   }
 
-  /**
-   * Export flow to Selenium Java + TestNG code
-   * @param {Object} flowData - Flow data from correlation engine
-   * @param {string} className - Test class name
-   * @returns {string} Generated Java code
-   */
   exportSelenium(flowData, className = 'GeneratedTest') {
     try {
       const imports = this.generateSeleniumImports();
       const classDeclaration = this.generateClassDeclaration(className);
-      const fieldDeclarations = this.generateFieldDeclarations();
-      const setupMethod = this.generateSetupMethod();
+      const fieldDeclarations = this.generateFieldDeclarations(flowData);
+      const setupMethod = this.generateSetupMethod(flowData);
       const teardownMethod = this.generateTeardownMethod();
       const testMethod = this.generateTestMethod(flowData);
 
@@ -40,65 +32,57 @@ class CodeExporter {
     }
   }
 
-  /**
-   * Generate Selenium imports
-   * @returns {string} Import statements
-   */
   generateSeleniumImports() {
     return [
       'package com.test;',
       '',
       'import org.openqa.selenium.*;',
+      'import org.openqa.selenium.chrome.ChromeDriver;',
       'import org.openqa.selenium.support.ui.WebDriverWait;',
       'import org.openqa.selenium.support.ui.ExpectedConditions;',
       'import org.testng.Assert;',
       'import org.testng.annotations.*;',
       'import java.time.Duration;',
+      'import java.util.HashMap;',
+      'import java.util.Map;',
       ''
     ].join(this.newLine);
   }
 
-  /**
-   * Generate class declaration
-   * @param {string} className - Class name
-   * @returns {string} Class declaration
-   */
   generateClassDeclaration(className) {
     return `public class ${className} {${this.newLine}`;
   }
 
-  /**
-   * Generate field declarations
-   * @returns {string} Field declarations
-   */
-  generateFieldDeclarations() {
+  generateFieldDeclarations(flowData) {
+    const variables = this.collectProducedVariables(flowData);
+    const variableLines = variables.map(variable =>
+      `${this.indent}private String ${this.toJavaIdentifier(variable.name)};`
+    );
+
     return [
       this.indent + 'private WebDriver driver;',
       this.indent + 'private WebDriverWait wait;',
+      this.indent + 'private Map<String, String> flowVars = new HashMap<>();',
+      ...variableLines,
       ''
     ].join(this.newLine);
   }
 
-  /**
-   * Generate setup method
-   * @returns {string} BeforeMethod annotation and setup code
-   */
-  generateSetupMethod() {
+  generateSetupMethod(flowData) {
+    const firstUrl = this.getBaseUrl(flowData);
+
     return [
       this.indent + '@BeforeMethod',
       this.indent + 'public void setUp() {',
       this.indent + this.indent + 'driver = new ChromeDriver();',
       this.indent + this.indent + 'driver.manage().window().maximize();',
       this.indent + this.indent + 'wait = new WebDriverWait(driver, Duration.ofSeconds(10));',
+      this.indent + this.indent + `driver.get("${this.escapeString(firstUrl)}");`,
       this.indent + '}',
       ''
     ].join(this.newLine);
   }
 
-  /**
-   * Generate teardown method
-   * @returns {string} AfterMethod annotation and teardown code
-   */
   generateTeardownMethod() {
     return [
       this.indent + '@AfterMethod',
@@ -111,163 +95,195 @@ class CodeExporter {
     ].join(this.newLine);
   }
 
-  /**
-   * Generate test method from flow data
-   * @param {Object} flowData - Flow data
-   * @returns {string} Test method code
-   */
   generateTestMethod(flowData) {
-    const steps = (flowData && flowData.flow) ? flowData.flow : [];
-
+    const steps = this.getReviewedSteps(flowData);
     const lines = [
       this.indent + '@Test',
-      this.indent + 'public void testUserFlow() {',
-      this.indent + this.indent + '// Navigate to base URL',
-      this.indent + this.indent + 'driver.get("https://example.com");',
-      this.newLine
+      this.indent + 'public void testReviewedFlow() {'
     ];
 
+    if (!steps.length) {
+      lines.push(this.indent + this.indent + '// No reviewed steps were available for export.');
+      lines.push(this.indent + '}');
+      return lines.join(this.newLine);
+    }
+
     steps.forEach((step, index) => {
-      const stepNum = index + 1;
-      
-      // Generate UI action code
-      if (step.step) {
-        lines.push(this.indent + this.indent + `// Step ${stepNum}: ${step.step.type || 'Action'}`);
-        lines.push(...this.generateSeleniumAction(step.step));
-      }
-
-      // Generate API validation code (comments for reference)
-      if (step.apiCalls && step.apiCalls.length > 0) {
-        lines.push(this.indent + this.indent + `// API Call: ${step.apiCalls[0].method || 'GET'} ${this.truncateUrl(step.apiCalls[0].url || '')}`);
-        lines.push(this.indent + this.indent + `// Expected Status: ${step.apiCalls[0].status || '200'}`);
-      }
-
-      // Generate DOM change validation
-      if (step.domChanges && step.domChanges.length > 0) {
-        lines.push(this.indent + this.indent + '// Wait for UI update after API response');
-        lines.push(this.indent + this.indent + 'wait.until(ExpectedConditions.visibilityOfElementLocated(By.cssSelector(".updated-element")));');
-      }
-
       lines.push('');
+      lines.push(this.indent + this.indent + `// Step ${index + 1}: ${step.step?.type || 'action'}`);
+      lines.push(...this.generateVariableAssignments(step.variables));
+      lines.push(...this.generateSeleniumAction(step.step));
+      lines.push(...this.generateApiReferenceComments(step.apiCalls));
+      lines.push(...this.generateSeleniumAssertions(step));
     });
 
     lines.push(this.indent + '}');
-
     return lines.join(this.newLine);
   }
 
-  /**
-   * Generate Selenium code for a single action
-   * @param {Object} action - UI action
-   * @returns {Array<string>} Code lines
-   */
+  generateVariableAssignments(variables) {
+    const produced = variables?.produced || [];
+    if (!produced.length) {
+      return [];
+    }
+
+    return produced.map(variable =>
+      `${this.indent}${this.indent}// Captured variable: ${this.toJavaIdentifier(variable.name)} (${this.escapeString(variable.valuePreview || '')})`
+    );
+  }
+
   generateSeleniumAction(action) {
+    if (!action) {
+      return [this.indent + this.indent + '// No UI action captured for this step'];
+    }
+
     const lines = [];
     const selector = this.getBestSelector(action);
-    const byType = this.getByType(selector);
+    const locator = this.getByType(selector);
 
     switch (action.type) {
       case 'click':
-        lines.push(
-          this.indent + this.indent + `wait.until(ExpectedConditions.elementToBeClickable(${byType})).click();`
-        );
+        lines.push(this.indent + this.indent + `wait.until(ExpectedConditions.elementToBeClickable(${locator})).click();`);
         break;
 
       case 'input':
-      case 'type':
-        const value = action.value || 'text';
-        lines.push(
-          this.indent + this.indent + `WebElement input${action.id || ''} = wait.until(ExpectedConditions.visibilityOfElementLocated(${byType}));`,
-          this.indent + this.indent + `input${action.id || ''}.clear();`,
-          this.indent + this.indent + `input${action.id || ''}.sendKeys("${this.escapeString(value)}");`
-        );
+      case 'type': {
+        const variableName = this.toJavaIdentifier(action.elementName || action.placeholder || 'inputValue');
+        const value = this.resolveActionInputValue(action);
+        lines.push(this.indent + this.indent + `WebElement ${variableName}Field = wait.until(ExpectedConditions.visibilityOfElementLocated(${locator}));`);
+        lines.push(this.indent + this.indent + `${variableName}Field.clear();`);
+        lines.push(this.indent + this.indent + `${variableName}Field.sendKeys("${this.escapeString(value)}");`);
+        break;
+      }
+
+      case 'focus':
+        lines.push(this.indent + this.indent + `wait.until(ExpectedConditions.visibilityOfElementLocated(${locator})).click();`);
         break;
 
-      case 'select':
-        const selectedValue = action.selectedValue || action.value || 'option';
-        lines.push(
-          this.indent + this.indent + `Select select${action.id || ''} = new Select(wait.until(ExpectedConditions.visibilityOfElementLocated(${byType})));`,
-          this.indent + this.indent + `select${action.id || ''}.selectByValue("${this.escapeString(selectedValue)}");`
-        );
+      case 'navigation':
+      case 'spa_navigation': {
+        const url = action.url || action.fromUrl || 'about:blank';
+        lines.push(this.indent + this.indent + `driver.navigate().to("${this.escapeString(url)}");`);
         break;
-
-      case 'navigate':
-        const url = action.url || 'about:blank';
-        lines.push(
-          this.indent + this.indent + `driver.navigate().to("${this.escapeString(url)}");`
-        );
-        break;
-
-      case 'scroll':
-        lines.push(
-          this.indent + this.indent + `((JavascriptExecutor) driver).executeScript("window.scrollBy(0, ${action.y || 500})");`
-        );
-        break;
+      }
 
       default:
-        lines.push(
-          this.indent + this.indent + `// Unknown action type: ${action.type}`,
-          this.indent + this.indent + `wait.until(ExpectedConditions.elementToBeClickable(${byType})).click();`
-        );
+        lines.push(this.indent + this.indent + `// Unsupported action type ${action.type}; using click fallback`);
+        lines.push(this.indent + this.indent + `wait.until(ExpectedConditions.elementToBeClickable(${locator})).click();`);
+        break;
     }
 
     return lines;
   }
 
-  /**
-   * Get best selector from action
-   * Priority: id > data-* > name > class > xpath
-   * @param {Object} action - UI action
-   * @returns {string} Best selector value
-   */
+  generateApiReferenceComments(apiCalls) {
+    const relevantApis = this.getRelevantApiCalls(apiCalls);
+    if (!relevantApis.length) {
+      return [];
+    }
+
+    return relevantApis.map(api =>
+      `${this.indent}${this.indent}// API expectation: ${api.method || 'GET'} ${this.truncateUrl(api.url || '')} -> ${api.status || 'N/A'}`
+    );
+  }
+
+  generateSeleniumAssertions(step) {
+    const lines = [];
+    const uiAssertions = step.assertions?.ui || [];
+    const apiAssertions = step.assertions?.api || [];
+
+    if (step.domChanges && step.domChanges.length > 0) {
+      lines.push(this.indent + this.indent + '// Wait for UI updates observed during recording');
+      lines.push(this.indent + this.indent + 'wait.until(driver -> ((JavascriptExecutor) driver).executeScript("return document.readyState").equals("complete"));');
+    }
+
+    uiAssertions.forEach(assertion => {
+      lines.push(this.indent + this.indent + `// UI assertion: ${this.escapeComment(assertion)}`);
+      lines.push(...this.generateUiAssertionLines(assertion));
+    });
+
+    apiAssertions.forEach(assertion => {
+      lines.push(this.indent + this.indent + `// API assertion: ${this.escapeComment(assertion)}`);
+    });
+
+    return lines;
+  }
+
+  generateUiAssertionLines(assertion) {
+    const normalized = assertion.toLowerCase();
+    const quotedText = this.extractQuotedText(assertion);
+
+    if (normalized.includes('url') && quotedText) {
+      return [
+        `${this.indent}${this.indent}Assert.assertTrue(driver.getCurrentUrl().contains("${this.escapeString(quotedText)}"));`
+      ];
+    }
+
+    if ((normalized.includes('visible') || normalized.includes('display')) && quotedText) {
+      return [
+        `${this.indent}${this.indent}Assert.assertTrue(driver.getPageSource().contains("${this.escapeString(quotedText)}"));`
+      ];
+    }
+
+    if ((normalized.includes('contains') || normalized.includes('text')) && quotedText) {
+      return [
+        `${this.indent}${this.indent}Assert.assertTrue(driver.getPageSource().contains("${this.escapeString(quotedText)}"));`
+      ];
+    }
+
+    return [
+      `${this.indent}${this.indent}// Manual assertion translation needed: ${this.escapeComment(assertion)}`
+    ];
+  }
+
   getBestSelector(action) {
-    if (action.selector) {
-      // Check for id
-      if (action.selector.id) return action.selector.id;
-      // Check for data-*
-      if (action.selector.dataTestId) return `[data-testid="${action.selector.dataTestId}"]`;
-      if (action.selector.dataCy) return `[data-cy="${action.selector.dataCy}"]`;
-      // Check for name
-      if (action.selector.name) return `[name="${action.selector.name}"]`;
-      // Check for class
-      if (action.selector.class) return `.${action.selector.class.split(' ')[0]}`;
+    const candidates = action.selectorCandidates || action.selectorProfile?.candidates || [];
+    if (candidates.length) {
+      return candidates[0].value;
     }
-    
-    // Fallback to xpath
-    return action.selector?.xpath || '//body';
+
+    if (typeof action.selector === 'string' && action.selector) {
+      return action.selector;
+    }
+
+    if (action.selectorProfile?.primary?.value) {
+      return action.selectorProfile.primary.value;
+    }
+
+    return action.xpath || '//body';
   }
 
-  /**
-   * Get Selenium By type from selector
-   * @param {string} selector - Selector string
-   * @returns {string} By type code
-   */
   getByType(selector) {
-    if (selector.startsWith('//')) {
-      return `By.xpath("${selector}")`;
-    } else if (selector.startsWith('.')) {
-      return `By.cssSelector("${selector}")`;
-    } else if (selector.startsWith('[')) {
-      return `By.cssSelector("${selector}")`;
-    } else if (selector.startsWith('#')) {
-      return `By.id("${selector.substring(1)}")`;
-    } else {
-      return `By.id("${selector}")`;
+    if (!selector) {
+      return 'By.xpath("//body")';
     }
+
+    if (selector.startsWith('//') || selector.startsWith('/')) {
+      return `By.xpath("${this.escapeString(selector)}")`;
+    }
+
+    if (selector.includes(':contains(')) {
+      const safeText = selector.split(':contains("')[1]?.replace('")', '') || '';
+      return `By.xpath("//*[contains(normalize-space(text()), '${this.escapeXPathText(safeText)}')]")`;
+    }
+
+    if (selector.startsWith('#')) {
+      return `By.cssSelector("${this.escapeString(selector)}")`;
+    }
+
+    if (selector.startsWith('.') || selector.startsWith('[')) {
+      return `By.cssSelector("${this.escapeString(selector)}")`;
+    }
+
+    return `By.cssSelector("${this.escapeString(selector)}")`;
   }
 
-  /**
-   * Export flow to Rest Assured code
-   * @param {Object} flowData - Flow data from correlation engine
-   * @param {string} className - Test class name
-   * @returns {string} Generated Java code
-   */
   exportRestAssured(flowData, className = 'APITest') {
     try {
       const imports = this.generateRestAssuredImports();
       const classDeclaration = this.generateClassDeclaration(className);
-      const fieldDeclarations = this.generateRestAssuredFields();
-      const setupMethod = this.generateRestAssuredSetup();
+      const fieldDeclarations = this.generateRestAssuredFields(flowData);
+      const setupMethod = this.generateRestAssuredSetup(flowData);
       const testMethods = this.generateRestAssuredTests(flowData);
 
       return [
@@ -283,10 +299,6 @@ class CodeExporter {
     }
   }
 
-  /**
-   * Generate Rest Assured imports
-   * @returns {string} Import statements
-   */
   generateRestAssuredImports() {
     return [
       'package com.test;',
@@ -295,7 +307,6 @@ class CodeExporter {
       'import io.restassured.http.ContentType;',
       'import io.restassured.response.Response;',
       'import io.restassured.specification.RequestSpecification;',
-      'import org.testng.Assert;',
       'import org.testng.annotations.*;',
       'import java.util.HashMap;',
       'import java.util.Map;',
@@ -305,23 +316,22 @@ class CodeExporter {
     ].join(this.newLine);
   }
 
-  /**
-   * Generate Rest Assured field declarations
-   * @returns {string} Field declarations
-   */
-  generateRestAssuredFields() {
+  generateRestAssuredFields(flowData) {
+    const variables = this.collectProducedVariables(flowData);
+    const variableLines = variables.map(variable =>
+      `${this.indent}private String ${this.toJavaIdentifier(variable.name)};`
+    );
+
     return [
-      this.indent + 'private static final String BASE_URI = "https://api.example.com";',
+      this.indent + `private static final String BASE_URI = "${this.escapeString(this.getApiBaseUri(flowData))}";`,
       this.indent + 'private RequestSpecification spec;',
+      this.indent + 'private Map<String, String> flowVars = new HashMap<>();',
+      ...variableLines,
       ''
     ].join(this.newLine);
   }
 
-  /**
-   * Generate Rest Assured setup method
-   * @returns {string} BeforeClass annotation and setup code
-   */
-  generateRestAssuredSetup() {
+  generateRestAssuredSetup(flowData) {
     return [
       this.indent + '@BeforeClass',
       this.indent + 'public void setup() {',
@@ -332,141 +342,210 @@ class CodeExporter {
     ].join(this.newLine);
   }
 
-  /**
-   * Generate Rest Assured test methods from flow data
-   * @param {Object} flowData - Flow data
-   * @returns {string} Test methods code
-   */
   generateRestAssuredTests(flowData) {
     const lines = [];
+    const steps = this.getReviewedSteps(flowData);
 
-    flowData.flow.forEach((step, index) => {
-      if (!step.apiCalls || step.apiCalls.length === 0) return;
+    steps.forEach((step, index) => {
+      const relevantApis = this.getRelevantApiCalls(step.apiCalls);
+      if (!relevantApis.length) {
+        return;
+      }
 
-      const testNum = index + 1;
-      const apiCall = step.apiCalls[0];
-      const testName = this.generateTestName(step, testNum);
+      const apiCall = relevantApis[0];
+      const testName = this.generateTestName(step, index + 1);
 
       lines.push(this.indent + '@Test');
       lines.push(this.indent + `public void ${testName}() {`);
-      lines.push(this.indent + this.indent + `// ${step.step?.type || 'Action'} -> API Call`);
-      lines.push('');
-
-      // Generate request
-      lines.push(...this.generateRestAssuredRequest(apiCall, step.step));
-      lines.push('');
-
-      // Generate assertions
-      lines.push(...this.generateRestAssuredAssertions(apiCall));
+      lines.push(this.indent + this.indent + `// ${step.step?.type || 'Action'} reviewed API validation`);
+      lines.push(...this.generateRestVariableComments(step.variables));
+      lines.push(...this.generateRestAssuredRequest(apiCall));
+      lines.push(...this.generateRestAssuredAssertions(apiCall, step.assertions?.api || []));
       lines.push(this.indent + '}');
       lines.push('');
     });
 
+    if (!lines.length) {
+      lines.push(this.indent + '// No reviewed API steps available for Rest Assured export.');
+      lines.push('');
+    }
+
     return lines.join(this.newLine);
   }
 
-  /**
-   * Generate test method name
-   * @param {Object} step - Flow step
-   * @param {number} testNum - Test number
-   * @returns {string} Test method name
-   */
   generateTestName(step, testNum) {
     const actionType = step.step?.type || 'action';
-    return `test${actionType.charAt(0).toUpperCase() + actionType.slice(1)}_Step${testNum}`;
+    return `test${actionType.charAt(0).toUpperCase() + actionType.slice(1)}Step${testNum}`;
   }
 
-  /**
-   * Generate Rest Assured request code
-   * @param {Object} apiCall - API call data
-   * @param {Object} uiAction - Related UI action
-   * @returns {Array<string>} Code lines
-   */
-  generateRestAssuredRequest(apiCall, uiAction) {
+  generateRestVariableComments(variables) {
+    const produced = variables?.produced || [];
+    return produced.map(variable =>
+      `${this.indent}${this.indent}// Produced variable: ${this.toJavaIdentifier(variable.name)} from ${variable.source}`
+    );
+  }
+
+  generateRestAssuredRequest(apiCall) {
     const lines = [];
     const method = (apiCall.method || 'GET').toLowerCase();
-    const url = apiCall.url || '/endpoint';
-    const body = apiCall.body || apiCall.requestBody || (apiCall.request && apiCall.request.postData ? apiCall.request.postData.text : null) || null;
+    const path = this.getRelativeApiPath(apiCall.url || '/');
+    const body = apiCall.requestBody || null;
 
-    // Start request
     lines.push(this.indent + this.indent + 'Response response = spec');
-    lines.push(this.indent + this.indent + '    .when()');
 
-    // Add method and URL
-    if (method === 'get') {
-      lines.push(this.indent + this.indent + `    .get("${this.escapeString(url)}")`);
-    } else if (method === 'post') {
-      if (body) {
-        lines.push(this.indent + this.indent + '    .body("""');
-        lines.push(this.indent + this.indent + this.escapeJson(body));
-        lines.push(this.indent + this.indent + '    """)');
-      }
-      lines.push(this.indent + this.indent + `    .post("${this.escapeString(url)}")`);
-    } else if (method === 'put') {
-      if (body) {
-        lines.push(this.indent + this.indent + '    .body("""');
-        lines.push(this.indent + this.indent + this.escapeJson(body));
-        lines.push(this.indent + this.indent + '    """)');
-      }
-      lines.push(this.indent + this.indent + `    .put("${this.escapeString(url)}")`);
-    } else if (method === 'delete') {
-      lines.push(this.indent + this.indent + `    .delete("${this.escapeString(url)}")`);
-    } else if (method === 'patch') {
-      if (body) {
-        lines.push(this.indent + this.indent + '    .body("""');
-        lines.push(this.indent + this.indent + this.escapeJson(body));
-        lines.push(this.indent + this.indent + '    """)');
-      }
-      lines.push(this.indent + this.indent + `    .patch("${this.escapeString(url)}")`);
+    if (body) {
+      lines.push(this.indent + this.indent + '    .body("""');
+      lines.push(this.indent + this.indent + this.escapeJson(body));
+      lines.push(this.indent + this.indent + '    """)');
     }
 
+    lines.push(this.indent + this.indent + '    .when()');
+    lines.push(this.indent + this.indent + `    .${method}("${this.escapeString(path)}")`);
     lines.push(this.indent + this.indent + '    .then()');
 
     return lines;
   }
 
-  /**
-   * Generate Rest Assured assertions
-   * @param {Object} apiCall - API call data
-   * @returns {Array<string>} Assertion code lines
-   */
-  generateRestAssuredAssertions(apiCall) {
+  generateRestAssuredAssertions(apiCall, reviewAssertions) {
     const lines = [];
     const status = apiCall.status || 200;
+    const responseBody = this.safeParse(apiCall.responseBody);
 
-    // Status code assertion
     lines.push(this.indent + this.indent + `    .statusCode(${status})`);
 
-    // Add response body assertions if available (support multiple field names)
-    const resp = apiCall.response || apiCall.responseBody || (apiCall.response && apiCall.response.body) || null;
-    if (resp) {
-      const responseBody = typeof resp === 'object' ? resp : this.safeParse(resp);
+    const autoAssertions = this.generateAutomaticApiAssertions(responseBody);
+    autoAssertions.forEach(assertion => lines.push(this.indent + this.indent + assertion));
 
-      if (responseBody) {
-        if (responseBody.id) {
-          lines.push(this.indent + this.indent + '    .body("id", notNullValue())');
-        }
-        if (responseBody.status) {
-          lines.push(this.indent + this.indent + `    .body("status", equalTo("${responseBody.status}"))`);
-        }
-        if (responseBody.success !== undefined) {
-          lines.push(this.indent + this.indent + `    .body("success", equalTo(${responseBody.success}))`);
-        }
-      }
-    }
+    reviewAssertions.forEach(assertion => {
+      lines.push(this.indent + this.indent + `    // Review assertion: ${this.escapeComment(assertion)}`);
+    });
 
     lines.push(this.indent + this.indent + '    .extract().response();');
+    return lines;
+  }
+
+  generateAutomaticApiAssertions(responseBody) {
+    if (!responseBody || typeof responseBody !== 'object') {
+      return [];
+    }
+
+    const lines = [];
+    if (responseBody.id !== undefined) {
+      lines.push('.body("id", notNullValue())');
+    }
+    if (responseBody.status !== undefined) {
+      lines.push(`.body("status", equalTo("${this.escapeString(String(responseBody.status))}"))`);
+    }
+    if (responseBody.success !== undefined) {
+      lines.push(`.body("success", equalTo(${responseBody.success}))`);
+    }
 
     return lines;
   }
 
-  /**
-   * Escape string for Java
-   * @param {string} str - String to escape
-   * @returns {string} Escaped string
-   */
+  exportCombined(flowData, seleniumClass = 'GeneratedTest', restAssuredClass = 'APITest') {
+    return {
+      selenium: this.exportSelenium(flowData, seleniumClass),
+      restAssured: this.exportRestAssured(flowData, restAssuredClass)
+    };
+  }
+
+  getReviewedSteps(flowData) {
+    const steps = flowData?.flow || [];
+    return steps.filter(step => (step.review?.status || 'pending') !== 'ignored');
+  }
+
+  getRelevantApiCalls(apiCalls = []) {
+    return apiCalls.filter(api => api.reviewSelection !== 'ignored');
+  }
+
+  collectProducedVariables(flowData) {
+    const steps = this.getReviewedSteps(flowData);
+    const unique = new Map();
+
+    steps.forEach(step => {
+      (step.variables?.produced || []).forEach(variable => {
+        if (!unique.has(variable.name)) {
+          unique.set(variable.name, variable);
+        }
+      });
+    });
+
+    return Array.from(unique.values());
+  }
+
+  resolveActionInputValue(action) {
+    if (action.inputValue) {
+      return action.inputValue;
+    }
+
+    if (action.value) {
+      return action.value;
+    }
+
+    return 'sample-value';
+  }
+
+  getBaseUrl(flowData) {
+    const firstStep = this.getReviewedSteps(flowData)[0];
+    return firstStep?.step?.url || 'https://example.com';
+  }
+
+  getApiBaseUri(flowData) {
+    const firstApi = this.getReviewedSteps(flowData)
+      .flatMap(step => this.getRelevantApiCalls(step.apiCalls))
+      .find(Boolean);
+
+    if (!firstApi?.url) {
+      return 'https://api.example.com';
+    }
+
+    try {
+      const parsed = new URL(firstApi.url);
+      return `${parsed.protocol}//${parsed.host}`;
+    } catch (error) {
+      return 'https://api.example.com';
+    }
+  }
+
+  getRelativeApiPath(url) {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.pathname}${parsed.search}`;
+    } catch (error) {
+      return url;
+    }
+  }
+
+  extractQuotedText(assertion) {
+    const match = assertion.match(/["']([^"']+)["']/);
+    return match ? match[1] : '';
+  }
+
+  toJavaIdentifier(name) {
+    const cleaned = String(name || 'value')
+      .replace(/[^a-zA-Z0-9]+/g, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+
+    if (!cleaned.length) {
+      return 'value';
+    }
+
+    return cleaned
+      .map((part, index) => {
+        const safe = part.replace(/^[0-9]+/, '');
+        const normalized = safe || 'value';
+        return index === 0
+          ? normalized.charAt(0).toLowerCase() + normalized.slice(1)
+          : normalized.charAt(0).toUpperCase() + normalized.slice(1);
+      })
+      .join('');
+  }
+
   escapeString(str) {
-    return str
+    return String(str)
       .replace(/\\/g, '\\\\')
       .replace(/"/g, '\\"')
       .replace(/\n/g, '\\n')
@@ -474,23 +553,18 @@ class CodeExporter {
       .replace(/\t/g, '\\t');
   }
 
-  /**
-   * Escape JSON for text block
-   * @param {string|Object} json - JSON to escape
-   * @returns {string} Escaped JSON
-   */
-  escapeJson(json) {
-    const jsonStr = typeof json === 'object' 
-      ? JSON.stringify(json, null, 2)
-      : json;
-    return jsonStr;
+  escapeXPathText(str) {
+    return String(str).replace(/'/g, "\\'");
   }
 
-  /**
-   * Safely parse JSON string
-   * @param {string} jsonStr - JSON string
-   * @returns {Object|null} Parsed object or null
-   */
+  escapeComment(str) {
+    return String(str).replace(/\*\//g, '* /');
+  }
+
+  escapeJson(json) {
+    return typeof json === 'object' ? JSON.stringify(json, null, 2) : String(json);
+  }
+
   safeParse(jsonStr) {
     try {
       return typeof jsonStr === 'string' ? JSON.parse(jsonStr) : jsonStr;
@@ -499,38 +573,15 @@ class CodeExporter {
     }
   }
 
-  /**
-   * Truncate URL for display
-   * @param {string} url - URL
-   * @param {number} maxLength - Max length
-   * @returns {string} Truncated URL
-   */
-  truncateUrl(url, maxLength = 50) {
-    if (url.length <= maxLength) return url;
-    return url.substring(0, maxLength) + '...';
-  }
-
-  /**
-   * Export to combined file (Selenium + Rest Assured)
-   * @param {Object} flowData - Flow data
-   * @param {string} seleniumClass - Selenium class name
-   * @param {string} restAssuredClass - Rest Assured class name
-   * @returns {Object} Object with both code strings
-   */
-  exportCombined(flowData, seleniumClass = 'GeneratedTest', restAssuredClass = 'APITest') {
-    return {
-      selenium: this.exportSelenium(flowData, seleniumClass),
-      restAssured: this.exportRestAssured(flowData, restAssuredClass)
-    };
+  truncateUrl(url, maxLength = 60) {
+    return url.length <= maxLength ? url : url.substring(0, maxLength) + '...';
   }
 }
 
-// Export for use in other modules (CommonJS)
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = CodeExporter;
 }
 
-// Make available globally for workers, content scripts, and other environments
 if (typeof globalThis !== 'undefined') {
   globalThis.CodeExporter = CodeExporter;
 }

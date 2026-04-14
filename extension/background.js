@@ -9,6 +9,8 @@
 // Load utility scripts
 importScripts('utils/correlation.js', 'utils/exporter.js');
 
+const SESSION_STORAGE_KEY = 'flowTraceSession';
+
 // Recording state
 let isRecording = false;
 let recordingStartTime = null;
@@ -17,9 +19,25 @@ let flowData = {
   apiCalls: [],
   correlations: []
 };
+let apiCaptureState = {
+  dedupeWindowMs: 1200,
+  sourcePriority: {
+    devtools: 3,
+    content: 2,
+    unknown: 1
+  },
+  fingerprintToId: {},
+  stats: {
+    accepted: 0,
+    deduped: 0,
+    merged: 0,
+    bySource: {}
+  }
+};
 
 // Correlation engine instance
 let correlationEngine = null;
+let restoreStatePromise = restorePersistedSession();
 
 // Initialize correlation engine
 function initCorrelationEngine() {
@@ -34,6 +52,9 @@ function initCorrelationEngine() {
 chrome.runtime.onInstalled.addListener((details) => {
   console.log('FlowTrace QA installed:', details.reason);
   resetState();
+  persistSession().catch(error => {
+    console.debug('Failed to persist reset state on install:', error.message || error);
+  });
 });
 
 /**
@@ -62,45 +83,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     case 'DOM_MUTATION':
-      // Forward DOM mutation to correlation engine
-      if (correlationEngine) {
-        try {
-          correlationEngine.addDomMutation(message.mutation);
-        } catch (e) {
-          console.debug('Error adding DOM mutation to correlation engine:', e.message || e);
-        }
-      }
-      // Notify devtools panel to refresh view
-      notifyDevTools({ type: 'DOM_MUTATION_RECORDED' });
-      sendResponse({ success: true });
-      break;
+      handleDomMutation(message, sendResponse);
+      return true;
 
     case 'GET_FLOW_DATA':
-      sendResponse({ 
-        success: true, 
-        flowData: getFlowData(),
-        stats: correlationEngine?.getStats()
-      });
-      break;
+      handleGetFlowData(sendResponse);
+      return true;
+
+    case 'UPDATE_CORRELATION_REVIEW':
+      handleUpdateCorrelationReview(message, sendResponse);
+      return true;
 
     case 'CLEAR_FLOW':
-      clearFlowData();
-      sendResponse({ success: true });
-      break;
+      handleClearFlow(sendResponse);
+      return true;
 
     case 'EXPORT_FLOW':
-      handleExportFlow(message);
-      sendResponse({ success: true });
-      break;
+      handleExportFlow(message, sendResponse);
+      return true;
 
     case 'GET_RECORDING_STATE':
-      sendResponse({ 
-        success: true, 
-        isRecording, 
-        recordingStartTime,
-        flowLength: flowData.uiActions.length + flowData.apiCalls.length
-      });
-      break;
+      handleGetRecordingState(sendResponse);
+      return true;
 
     case 'CORRELATE_NOW':
       if (correlationEngine) {
@@ -125,6 +129,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
  */
 async function handleStartRecording(message, sendResponse) {
   try {
+    await ensureSessionLoaded();
     console.log('[FlowTrace] Starting recording...', message);
     
     // Reset state
@@ -134,6 +139,7 @@ async function handleStartRecording(message, sendResponse) {
     // Set recording state
     isRecording = true;
     recordingStartTime = Date.now();
+    await persistSession();
 
     // Use provided tabId or get active tab
     let tab = null;
@@ -178,7 +184,8 @@ async function handleStartRecording(message, sendResponse) {
     try {
       await chrome.tabs.sendMessage(tab.id, { 
         type: 'START_RECORDING',
-        recordingStartTime 
+        recordingStartTime,
+        networkCaptureMode: 'devtools-primary'
       });
       console.log('[FlowTrace] Notified content script');
     } catch (msgError) {
@@ -212,6 +219,7 @@ async function handleStartRecording(message, sendResponse) {
  */
 async function handleStopRecording(message, sendResponse) {
   try {
+    await ensureSessionLoaded();
     console.log('[FlowTrace] Stopping recording...');
     
     // Set recording state
@@ -221,6 +229,9 @@ async function handleStopRecording(message, sendResponse) {
     if (correlationEngine) {
       correlationEngine.attemptCorrelation();
     }
+
+    recordingStartTime = null;
+    await persistSession();
 
     // Get final flow data
     const finalFlowData = getFlowData();
@@ -235,9 +246,6 @@ async function handleStopRecording(message, sendResponse) {
       stats: correlationEngine?.getStats()
     });
 
-    // Reset recording state but keep flow data for export
-    recordingStartTime = null;
-
     sendResponse({ 
       success: true, 
       flowData: finalFlowData,
@@ -248,6 +256,39 @@ async function handleStopRecording(message, sendResponse) {
     console.error('[FlowTrace] Error stopping recording:', error);
     sendResponse({ success: false, error: error.message });
   }
+}
+
+async function handleUpdateCorrelationReview(message, sendResponse) {
+  await ensureSessionLoaded();
+  if (!correlationEngine) {
+    sendResponse({ success: false, error: 'Correlation engine not initialized' });
+    return;
+  }
+
+  const updated = correlationEngine.updateCorrelationReview(message.correlationId, {
+    uiAssertions: message.uiAssertions,
+    apiAssertions: message.apiAssertions,
+    reviewStatus: message.reviewStatus,
+    reviewNotes: message.reviewNotes,
+    apiSelections: message.apiSelections
+  });
+
+  if (!updated) {
+    sendResponse({ success: false, error: 'Correlation not found' });
+    return;
+  }
+
+  await persistSession();
+
+  notifyDevTools({
+    type: 'CORRELATION_REVIEW_UPDATED',
+    correlationId: message.correlationId
+  });
+
+  sendResponse({
+    success: true,
+    correlation: updated
+  });
 }
 
 /**
@@ -271,6 +312,10 @@ function handleUIAction(message, sender) {
     correlationEngine.addUIAction(action);
   }
 
+  persistSession().catch(error => {
+    console.debug('Failed to persist UI action:', error.message || error);
+  });
+
   // Notify devtools panel
   notifyDevTools({
     type: 'UI_ACTION_RECORDED',
@@ -287,35 +332,198 @@ function handleUIAction(message, sender) {
 function handleAPICall(message, sender) {
   if (!isRecording) return;
 
-  const apiCall = {
-    ...message.apiCall,
-    tabId: sender.tab?.id,
-    recordedAt: Date.now()
-  };
+  const apiCall = normalizeAPICall(message.apiCall, sender);
+  const captureResult = upsertAPICall(apiCall);
 
-  // Store API call
-  flowData.apiCalls.push(apiCall);
-
-  // Add to correlation engine
-  if (correlationEngine) {
-    correlationEngine.addAPICall(apiCall);
+  if (!captureResult.accepted) {
+    return;
   }
+
+  if (captureResult.shouldAddToCorrelation && correlationEngine) {
+    correlationEngine.addAPICall(captureResult.apiCall);
+  }
+
+  persistSession().catch(error => {
+    console.debug('Failed to persist API call:', error.message || error);
+  });
 
   // Notify devtools panel
   notifyDevTools({
     type: 'API_CALL_RECORDED',
-    apiCall: apiCall,
-    totalAPICalls: flowData.apiCalls.length
+    apiCall: captureResult.apiCall,
+    totalAPICalls: flowData.apiCalls.length,
+    deduped: captureResult.deduped
   });
 
-  console.log('API Call recorded:', apiCall.method, apiCall.url?.substring(0, 50));
+  console.log(
+    'API Call recorded:',
+    captureResult.apiCall.method,
+    captureResult.apiCall.url?.substring(0, 50),
+    'source:',
+    captureResult.apiCall.capture?.source
+  );
+}
+
+function normalizeAPICall(apiCall, sender) {
+  const source = apiCall?.capture?.source || inferCaptureSource(sender);
+  const receivedAt = Date.now();
+
+  return {
+    ...apiCall,
+    tabId: apiCall?.tabId || sender.tab?.id,
+    recordedAt: receivedAt,
+    capture: {
+      ...(apiCall?.capture || {}),
+      source,
+      receivedAt,
+      priority: getSourcePriority(source),
+      mode: apiCall?.capture?.mode || 'unknown'
+    }
+  };
+}
+
+function inferCaptureSource(sender) {
+  if (sender.tab) return 'content';
+  return 'unknown';
+}
+
+function getSourcePriority(source) {
+  return apiCaptureState.sourcePriority[source] || apiCaptureState.sourcePriority.unknown;
+}
+
+function buildAPIFingerprint(apiCall) {
+  const method = (apiCall.method || 'GET').toUpperCase();
+  const normalizedUrl = normalizeUrlForFingerprint(apiCall.url || '');
+  const status = apiCall.status || 'na';
+  const tabId = apiCall.tabId || 'na';
+  const requestBody = truncateForFingerprint(apiCall.requestBody);
+
+  return [tabId, method, normalizedUrl, status, requestBody].join('|');
+}
+
+function normalizeUrlForFingerprint(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+
+    const params = Array.from(parsed.searchParams.entries())
+      .filter(([key]) => !key.startsWith('_') && key !== 'cacheBust' && key !== 'timestamp')
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    parsed.search = '';
+    const query = params
+      .map(([key, value]) => `${key}=${value}`)
+      .join('&');
+
+    return `${parsed.origin}${parsed.pathname}${query ? '?' + query : ''}`;
+  } catch (error) {
+    return url.split('#')[0];
+  }
+}
+
+function truncateForFingerprint(value, maxLength = 120) {
+  if (value === null || value === undefined) return '';
+
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return text.length > maxLength ? text.substring(0, maxLength) : text;
+}
+
+function upsertAPICall(apiCall) {
+  const fingerprint = buildAPIFingerprint(apiCall);
+  const existingId = apiCaptureState.fingerprintToId[fingerprint];
+
+  apiCaptureState.stats.bySource[apiCall.capture.source] =
+    (apiCaptureState.stats.bySource[apiCall.capture.source] || 0) + 1;
+
+  if (!existingId) {
+    const stored = {
+      ...apiCall,
+      id: `api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      fingerprint
+    };
+
+    flowData.apiCalls.push(stored);
+    apiCaptureState.fingerprintToId[fingerprint] = stored.id;
+    apiCaptureState.stats.accepted += 1;
+
+    return {
+      accepted: true,
+      deduped: false,
+      shouldAddToCorrelation: true,
+      apiCall: stored
+    };
+  }
+
+  const existing = flowData.apiCalls.find(call => call.id === existingId);
+  if (!existing) {
+    delete apiCaptureState.fingerprintToId[fingerprint];
+    return upsertAPICall(apiCall);
+  }
+
+  const withinWindow = Math.abs((apiCall.capture.receivedAt || 0) - (existing.capture?.receivedAt || 0)) <= apiCaptureState.dedupeWindowMs;
+  if (!withinWindow) {
+    const variantFingerprint = `${fingerprint}|${Date.now()}`;
+    const stored = {
+      ...apiCall,
+      id: `api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      fingerprint: variantFingerprint
+    };
+
+    flowData.apiCalls.push(stored);
+    apiCaptureState.fingerprintToId[variantFingerprint] = stored.id;
+    apiCaptureState.stats.accepted += 1;
+
+    return {
+      accepted: true,
+      deduped: false,
+      shouldAddToCorrelation: true,
+      apiCall: stored
+    };
+  }
+
+  apiCaptureState.stats.deduped += 1;
+  const incomingPriority = apiCall.capture.priority || 0;
+  const existingPriority = existing.capture?.priority || 0;
+
+  if (incomingPriority >= existingPriority) {
+    mergeAPICall(existing, apiCall);
+    apiCaptureState.stats.merged += 1;
+  }
+
+  return {
+    accepted: true,
+    deduped: true,
+    shouldAddToCorrelation: false,
+    apiCall: existing
+  };
+}
+
+function mergeAPICall(target, incoming) {
+  target.method = incoming.method || target.method;
+  target.url = incoming.url || target.url;
+  target.status = incoming.status ?? target.status;
+  target.requestHeaders = incoming.requestHeaders || target.requestHeaders;
+  target.responseHeaders = incoming.responseHeaders || target.responseHeaders;
+  target.requestBody = incoming.requestBody ?? target.requestBody;
+  target.responseBody = incoming.responseBody ?? target.responseBody;
+  target.error = incoming.error ?? target.error;
+  target.recordedAt = Math.min(target.recordedAt || Infinity, incoming.recordedAt || Infinity);
+  target.capture = {
+    ...target.capture,
+    ...incoming.capture,
+    mergedSources: Array.from(new Set([
+      ...(target.capture?.mergedSources || [target.capture?.source].filter(Boolean)),
+      incoming.capture?.source
+    ].filter(Boolean)))
+  };
 }
 
 /**
  * Handle export flow request
  */
-async function handleExportFlow(message) {
+async function handleExportFlow(message, sendResponse) {
   try {
+    await ensureSessionLoaded();
     const { format } = message;
     const flowData = getFlowData();
 
@@ -345,6 +553,11 @@ async function handleExportFlow(message) {
       fileName = 'CombinedTest.java';
     }
 
+    if ((flowData.uiActions.length === 0 && flowData.correlations.length === 0) || !exportedCode) {
+      sendResponse({ success: false, error: 'No recorded flow available for export' });
+      return;
+    }
+
     // Download file
     await downloadFile(exportedCode, fileName);
 
@@ -356,6 +569,7 @@ async function handleExportFlow(message) {
     });
 
     console.log('Flow exported as:', format);
+    sendResponse({ success: true, fileName });
 
   } catch (error) {
     console.error('Error exporting flow:', error);
@@ -363,7 +577,50 @@ async function handleExportFlow(message) {
       type: 'EXPORT_ERROR',
       error: error.message
     });
+    sendResponse({ success: false, error: error.message });
   }
+}
+
+async function handleDomMutation(message, sendResponse) {
+  await ensureSessionLoaded();
+
+  if (correlationEngine) {
+    try {
+      correlationEngine.addDomMutation(message.mutation);
+      await persistSession();
+    } catch (e) {
+      console.debug('Error adding DOM mutation to correlation engine:', e.message || e);
+    }
+  }
+
+  notifyDevTools({ type: 'DOM_MUTATION_RECORDED' });
+  sendResponse({ success: true });
+}
+
+async function handleGetFlowData(sendResponse) {
+  await ensureSessionLoaded();
+  sendResponse({
+    success: true,
+    flowData: getFlowData(),
+    stats: correlationEngine?.getStats()
+  });
+}
+
+async function handleClearFlow(sendResponse) {
+  await ensureSessionLoaded();
+  clearFlowData();
+  await persistSession();
+  sendResponse({ success: true });
+}
+
+async function handleGetRecordingState(sendResponse) {
+  await ensureSessionLoaded();
+  sendResponse({
+    success: true,
+    isRecording,
+    recordingStartTime,
+    flowLength: flowData.uiActions.length + flowData.apiCalls.length
+  });
 }
 
 /**
@@ -376,7 +633,10 @@ function getFlowData() {
     correlations: correlationEngine ? correlationEngine.getCorrelations() : [],
     recordingStartTime: recordingStartTime,
     recordingStopTime: isRecording ? null : Date.now(),
-    stats: correlationEngine ? correlationEngine.getStats() : null
+    stats: {
+      correlation: correlationEngine ? correlationEngine.getStats() : null,
+      capture: apiCaptureState.stats
+    }
   };
 }
 
@@ -393,6 +653,8 @@ function clearFlowData() {
   if (correlationEngine) {
     correlationEngine.clear();
   }
+
+  resetAPICaptureState();
 
   notifyDevTools({
     type: 'FLOW_CLEARED'
@@ -413,6 +675,72 @@ function resetState() {
     correlations: []
   };
   correlationEngine = null;
+  resetAPICaptureState();
+}
+
+async function ensureSessionLoaded() {
+  await restoreStatePromise;
+}
+
+async function restorePersistedSession() {
+  try {
+    const stored = await chrome.storage.local.get(SESSION_STORAGE_KEY);
+    const session = stored?.[SESSION_STORAGE_KEY];
+    if (!session) {
+      return;
+    }
+
+    isRecording = Boolean(session.isRecording);
+    recordingStartTime = session.recordingStartTime || null;
+    flowData = {
+      uiActions: session.flowData?.uiActions || [],
+      apiCalls: session.flowData?.apiCalls || [],
+      correlations: session.flowData?.correlations || []
+    };
+    apiCaptureState = session.apiCaptureState || apiCaptureState;
+
+    initCorrelationEngine();
+    correlationEngine.uiActions = structuredClone(flowData.uiActions);
+    correlationEngine.apiCalls = structuredClone(flowData.apiCalls);
+    correlationEngine.correlations = structuredClone(flowData.correlations);
+  } catch (error) {
+    console.debug('Failed to restore persisted session:', error.message || error);
+  }
+}
+
+async function persistSession() {
+  const session = {
+    isRecording,
+    recordingStartTime,
+    flowData: {
+      uiActions: flowData.uiActions,
+      apiCalls: flowData.apiCalls,
+      correlations: correlationEngine ? correlationEngine.getCorrelations() : []
+    },
+    apiCaptureState
+  };
+
+  await chrome.storage.local.set({
+    [SESSION_STORAGE_KEY]: session
+  });
+}
+
+function resetAPICaptureState() {
+  apiCaptureState = {
+    dedupeWindowMs: 1200,
+    sourcePriority: {
+      devtools: 3,
+      content: 2,
+      unknown: 1
+    },
+    fingerprintToId: {},
+    stats: {
+      accepted: 0,
+      deduped: 0,
+      merged: 0,
+      bySource: {}
+    }
+  };
 }
 
 /**
